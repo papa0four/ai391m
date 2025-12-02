@@ -1,0 +1,304 @@
+from __future__ import annotations
+import argparse
+import os
+import json
+import csv
+from pathlib import Path
+from typing import List, Tuple, Union
+
+import joblib
+import numpy as np
+import matplotlib.pyplot as plt
+import shap
+
+from src.utils import ensure_dir, timestamp
+
+# -----------------------------
+# Data loading / name utilities
+# -----------------------------
+
+def load_npz(npz_path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str], List[str]]:
+    d = np.load(npz_path, allow_pickle=True)
+    X_train, y_train = d["X_train"], d["y_train"]
+    X_val, y_val = d["X_val"], d["y_val"]
+    X_test, y_test = d["X_test"], d["y_test"]
+    feat_names = d["feat_names"].tolist()
+    class_names = d["class_names"].tolist()
+    return (X_train, y_train, X_val, y_val, X_test, y_test, feat_names, class_names)
+
+
+def _norm_1d_names(names: Union[List, np.ndarray]) -> List[str]:
+    """Normalize possibly nested/singleton-wrapped names to a flat list[str]."""
+    if isinstance(names, np.ndarray):
+        names = names.tolist()
+    out: List[str] = []
+    for x in names:
+        if isinstance(x, (list, tuple, np.ndarray)) and len(x) == 1:
+            out.append(str(x[0]))
+        else:
+            out.append(str(x))
+    return out
+
+
+# -----------------------------
+# SHAP explainer helpers
+# -----------------------------
+
+def pick_explainer(model, X_bg: np.ndarray):
+    """Prefer TreeExplainer; fallback to Linear; then Kernel (generic, slower).
+    Returns (explainer, kind_str).
+    """
+    # Try TreeExplainer
+    try:
+        expl = shap.TreeExplainer(model)
+        _ = expl.expected_value  # validate
+        return expl, "tree"
+    except Exception:
+        pass
+
+    # Try LinearExplainer
+    try:
+        expl = shap.LinearExplainer(model, X_bg)
+        _ = expl.expected_value
+        return expl, "linear"
+    except Exception:
+        pass
+
+    # KernelExplainer (generic). Use small background for speed
+    bg = X_bg if X_bg.shape[0] <= 200 else X_bg[:200]
+    predict_fn = model.predict_proba if hasattr(model, "predict_proba") else model.predict
+    expl = shap.KernelExplainer(predict_fn, bg)
+    return expl, "kernel"
+
+
+# -----------------------------
+# Plotting / save helpers
+# -----------------------------
+
+def save_shap_summary(shap_values: np.ndarray, Xs: np.ndarray, feat_names: List[str], out_path: str) -> None:
+    plt.figure()
+    shap.summary_plot(shap_values, Xs, feature_names=feat_names, show=False)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close()
+
+
+def save_shap_waterfall(values: np.ndarray, base_value: float, row: np.ndarray, feat_names: List[str], out_path: str) -> None:
+    """Compat waterfall for SHAP versions that expect either Explanation or
+    (expected_value, shap_values, ...) signature. We call the latter to avoid
+    relying on Explanation.expected_value (missing in some versions)."""
+    plt.figure()
+    shap.plots._waterfall.waterfall_legacy(
+        base_value,              # expected_value
+        values,                  # shap_values for a single sample [n_features]
+        feature_names=feat_names,
+        features=row,
+        show=False,
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=180, bbox_inches="tight")
+    plt.close()
+
+
+def _to_str(x) -> str:
+    if isinstance(x, (list, tuple, np.ndarray)) and len(x) == 1:
+        return str(x[0])
+    return str(x)
+
+
+def save_top_features_tables(
+    sv_list: List[np.ndarray],
+    feat_names: List[str],
+    class_names: List[str],
+    k: int,
+    out_dir: str,
+    tag: str,
+) -> None:
+    """Write per-class top-k features by mean |SHAP| as CSVs + one JSON index.
+
+    Args:
+        sv_list: list of [n_samples, n_features] SHAP arrays, one per class.
+        feat_names: length-n_features list of names.
+        class_names: list of class labels; len >= len(sv_list) ideal.
+        k: top-k cutoff.
+        out_dir: output directory for files.
+        tag: file tag/prefix.
+    """
+    outp = Path(out_dir)
+    outp.mkdir(parents=True, exist_ok=True)
+
+    names_arr = np.array(feat_names, dtype=object).ravel()
+
+    table = {}
+    for ci, sv in enumerate(sv_list):
+        cname = class_names[ci] if ci < len(class_names) else f"class_{ci}"
+        # sv shape expected: [n_samples, n_features]
+        if sv.ndim != 2:
+            raise ValueError(f"Expected 2D SHAP array per class, got shape {sv.shape} for class index {ci}")
+
+        mean_abs = np.abs(sv).mean(axis=0)  # [n_features]
+        top_idx = np.argsort(-mean_abs)[:k]
+        top_names = names_arr[top_idx].tolist()
+        top_scores = mean_abs[top_idx].astype(float).tolist()
+
+        rows = [{"feature": _to_str(n), "mean_abs_shap": float(s)} for n, s in zip(top_names, top_scores)]
+        table[cname] = rows
+
+        csv_path = outp / f"{tag}_topk{k}_{cname}.csv"
+        with csv_path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["feature", "mean_abs_shap"])
+            w.writeheader()
+            w.writerows(rows)
+
+    json_path = outp / f"{tag}_topk{k}_per_class_features.json"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(table, f, indent=2)
+    print("[OK] Wrote per-class top-k feature tables:", json_path, "(and per-class CSVs alongside)")
+
+
+# -----------------------------
+# Main
+# -----------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Explain trained model with SHAP (per-class Option A)")
+    parser.add_argument("--dataset_npz", required=True)
+    parser.add_argument("--model_path", required=True)
+    parser.add_argument("--task", required=True, choices=["detect", "classify"])
+    parser.add_argument("--out_figs", default="outputs/figures")
+    parser.add_argument("--nsamples", type=int, default=2000, help="Subset for SHAP speed")
+    parser.add_argument("--topk", type=int, default=20, help="Top-k features per class for tables")
+    parser.add_argument("--per_class_summaries", action="store_true", help="Also save a SHAP summary plot for every class")
+    args = parser.parse_args()
+
+    ensure_dir(args.out_figs)
+
+    X_tr, y_tr, X_va, y_va, X_te, y_te, feat_names, class_names = load_npz(args.dataset_npz)
+    feat_names = _norm_1d_names(feat_names)
+    class_names = _norm_1d_names(class_names)
+
+    model = joblib.load(args.model_path)
+
+    # Subsample test set for SHAP speed if very large
+    if X_te.shape[0] > args.nsamples:
+        rs = np.random.RandomState(0)
+        sel = rs.choice(X_te.shape[0], size=args.nsamples, replace=False)
+        Xs, ys = X_te[sel], y_te[sel]
+    else:
+        Xs, ys = X_te, y_te
+
+    # Background for Linear/Kernel explainers
+    X_bg = X_tr if X_tr.shape[0] <= 500 else X_tr[:500]
+    explainer, kind = pick_explainer(model, X_bg)
+
+    tag = f"{Path(args.model_path).stem}_{timestamp()}"
+
+    if args.task == "detect":
+        # Binary detection
+        try:
+            sv_all = explainer.shap_values(Xs)
+        except Exception:
+            sv_all = explainer.shap_values(Xs)
+
+        # TreeExplainer often returns [class0, class1] for binary
+        if isinstance(sv_all, list):
+            pos_idx = 1 if len(sv_all) > 1 else 0
+            sv = sv_all[pos_idx]
+            try:
+                base = explainer.expected_value[pos_idx]
+            except Exception:
+                base = explainer.expected_value if hasattr(explainer, "expected_value") else 0.0
+        else:
+            sv = sv_all
+            base = explainer.expected_value if hasattr(explainer, "expected_value") else 0.0
+
+        # Global summary
+        gsum_path = os.path.join(args.out_figs, f"{tag}_shap_summary_detect.png")
+        save_shap_summary(sv, Xs, feat_names, gsum_path)
+        print("[OK] Global SHAP summary:", gsum_path)
+
+        # Local example: pick FP or FN if available
+        if hasattr(model, "predict_proba"):
+            score = model.predict_proba(Xs)[:, 1]
+            yhat = (score >= 0.5).astype(int)
+        else:
+            yhat = model.predict(Xs).astype(int)
+
+        fp_idx = np.where((yhat == 1) & (ys == 0))[0]
+        fn_idx = np.where((yhat == 0) & (ys == 1))[0]
+        pick = int(fp_idx[0]) if fp_idx.size else (int(fn_idx[0]) if fn_idx.size else 0)
+
+        local_path = os.path.join(args.out_figs, f"{tag}_shap_local_detect.png")
+        save_shap_waterfall(sv[pick], base, Xs[pick], feat_names, local_path)
+        print("[OK] Local SHAP waterfall:", local_path)
+
+    else:
+        # Multiclass classification (Option A): per-class processing
+        sv_all = explainer.shap_values(Xs)
+
+        if isinstance(sv_all, list):
+            # Expected: list of [n_samples, n_features] per class
+            sv_list = sv_all
+            ev = getattr(explainer, "expected_value", [0.0] * len(sv_list))
+            expected_values = ev if isinstance(ev, list) else [ev] * len(sv_list)
+        else:
+            # Some explainers may return a 2D array. Treat it as single-class list.
+            if sv_all.ndim == 2:
+                sv_list = [sv_all]
+                ev = getattr(explainer, "expected_value", 0.0)
+                expected_values = [ev]
+            elif sv_all.ndim == 3 and sv_all.shape[-1] == len(class_names):
+                # Rare case: [n_samples, n_features, n_classes] -> split last dim
+                sv_list = [sv_all[:, :, ci] for ci in range(sv_all.shape[-1])]
+                ev = getattr(explainer, "expected_value", [0.0] * len(sv_list))
+                expected_values = ev if isinstance(ev, list) else [ev] * len(sv_list)
+            else:
+                raise ValueError(
+                    f"Unexpected SHAP value shape for multiclass: {sv_all.shape}. "
+                    "Expected list-of-2D or 2D/3D decomposable to per-class."
+                )
+
+        # Per-class top-k tables (CSV + one JSON)
+        save_top_features_tables(
+            sv_list=sv_list,
+            feat_names=feat_names,
+            class_names=class_names,
+            k=args.topk,
+            out_dir=args.out_figs,
+            tag=tag,
+        )
+
+        # Optional: per-class SHAP summary plots
+        if args.per_class_summaries:
+            for ci, sv_c in enumerate(sv_list):
+                cname = class_names[ci] if ci < len(class_names) else f"class_{ci}"
+                fig_path = os.path.join(args.out_figs, f"{tag}_shap_summary_class_{cname}.png")
+                save_shap_summary(sv_c, Xs, feat_names, fig_path)
+                print(f"[OK] Per-class SHAP summary: {fig_path}")
+
+        # Convenience global plot: choose the most frequent class in Xs
+        counts = np.bincount(ys.astype(int)) if ys.size else np.array([1])
+        top_c = int(np.argmax(counts))
+        top_c = min(top_c, len(sv_list) - 1)
+        sv_top = sv_list[top_c]
+        base_top = expected_values[top_c] if top_c < len(expected_values) else 0.0
+
+        gsum_path = os.path.join(args.out_figs, f"{tag}_shap_summary_classify_c{top_c}.png")
+        save_shap_summary(sv_top, Xs, feat_names, gsum_path)
+        print("[OK] Global SHAP summary (class):", gsum_path)
+
+        # Local example: correctly predicted example of that class if possible
+        try:
+            yhat = model.predict(Xs).astype(int)
+            idxs = np.where((yhat == top_c) & (ys == top_c))[0]
+            pick = int(idxs[0]) if idxs.size else 0
+        except Exception:
+            pick = 0
+
+        local_path = os.path.join(args.out_figs, f"{tag}_shap_local_classify_c{top_c}.png")
+        save_shap_waterfall(sv_top[pick], base_top, Xs[pick], feat_names, local_path)
+        print("[OK] Local SHAP waterfall (class):", local_path)
+
+
+if __name__ == "__main__":
+    main()
