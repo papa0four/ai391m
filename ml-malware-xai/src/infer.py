@@ -1,0 +1,73 @@
+# src/infer.py
+from __future__ import annotations
+import os, argparse, json, numpy as np
+import joblib
+
+def load_model(path):
+    return joblib.load(path)
+
+def load_feat_names_from_npz(npz_path):
+    d = np.load(npz_path, allow_pickle=True)
+    return list(d["feat_names"])
+
+def vectorize_from_jsonl_line(json_line: str, feat_names):
+    """Vectorize ONE raw EMBER json object using the official FeatureExtractor v2."""
+    import ember
+    raw = json.loads(json_line)
+    extractor = ember.features.PEFeatureExtractor(2)  # v2
+    vec = extractor.process_raw_features(raw["features"] if "features" in raw else raw)
+    x = np.zeros(len(feat_names), dtype=np.float32)
+    # Ember's output is already an ordered vector of the right length (v2 = 2381),
+    # so we just copy it in:
+    x[:] = vec[:len(feat_names)]
+    return x.reshape(1, -1)
+
+def main():
+    ap = argparse.ArgumentParser(description="Score samples with trained detector; optional handoff to classifier")
+    ap.add_argument("--model_path", required=True, help="detect model .pkl")
+    ap.add_argument("--feat_ref_npz", required=True, help="any NPZ with feat_names (to assert length/order)")
+    group = ap.add_mutually_exclusive_group(required=True)
+    group.add_argument("--jsonl", help="path to a file containing ONE EMBER-style JSON line")
+    group.add_argument("--npz_row", nargs=2, metavar=("NPZ","ROW_INDEX"),
+                       help="score an existing NPZ row (debug)")
+    ap.add_argument("--threshold", type=float, default=0.5, help="decision threshold on P(malicious)")
+    ap.add_argument("--family_model", default=None, help="optional multiclass model .pkl for Mal-API handoff")
+    ap.add_argument("--family_feat_npz", default=None, help="optional NPZ holding TF-IDF feat_names for classifier")
+    ap.add_argument("--family_doc", default=None, help="text file with API tokens for the same sample (space-separated)")
+    args = ap.parse_args()
+
+    feat_names = load_feat_names_from_npz(args.feat_ref_npz)
+    clf = load_model(args.model_path)
+
+    if args.jsonl:
+        with open(args.jsonl, "r", encoding="utf-8") as f:
+            line = f.readline().strip()
+        X = vectorize_from_jsonl_line(line, feat_names)
+    else:
+        npz, idx = args.npz_row[0], int(args.npz_row[1])
+        d = np.load(npz, allow_pickle=True)
+        X = d["X"][idx:idx+1]
+
+    prob = float(clf.predict_proba(X)[:,1][0])
+    label = "malicious" if prob >= args.threshold else "benign"
+    print(json.dumps({"p_malicious": prob, "label": label, "threshold": args.threshold}, indent=2))
+
+    # optional handoff: only if malicious and args.family_model provided
+    if label == "malicious" and args.family_model:
+        fam_clf = joblib.load(args.family_model)
+        if not args.family_doc or not args.family_feat_npz:
+            print("[WARN] family_model provided but --family_doc or --family_feat_npz missing; skipping classification.")
+            return
+        # build TF-IDF using saved vocabulary (from the Mal-API NPZ)
+        vocab = list(np.load(args.family_feat_npz, allow_pickle=True)["feat_names"])
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vect = TfidfVectorizer(token_pattern=r"[^ \t\r\n]+", vocabulary=vocab)
+        with open(args.family_doc, "r", encoding="utf-8") as f:
+            doc = f.read().strip()
+        Xfam = vect.fit_transform([doc]).astype(np.float32)
+        yhat = fam_clf.predict(Xfam)[0]
+        class_names = list(np.load(args.family_feat_npz, allow_pickle=True)["class_names"])
+        print(json.dumps({"family_pred": class_names[int(yhat)]}, indent=2))
+
+if __name__ == "__main__":
+    main()
